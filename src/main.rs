@@ -1,26 +1,15 @@
+#![feature(ipv6_to_octets)]
 use std::net::{TcpStream, TcpListener};
 use std::thread;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, lookup_host, IpAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, IpAddr};
 use std::io::{Read, Write, Result};
-use std::mem::transmute;
-
-fn to_ipv4(b: &[u8]) -> Ipv4Addr {
-    Ipv4Addr::new(b[0], b[1], b[2], b[3])
-}
-
-fn to_ipv6(b: &[u8]) -> Ipv6Addr {
-    let mut v = Vec::from(b);
-    v.reverse();
-    let mut t: &[u16] = unsafe { transmute(&v[..]) };
-    Ipv6Addr::new(t[7], t[6], t[5], t[4], t[3], t[2], t[1], t[0])
-}
+use std::sync::{Arc, Mutex};
 
 fn main() {
     let server = TcpListener::bind("0.0.0.0:1080").unwrap();
 
     struct Session {
-        inbound: TcpStream,
-        outbound: Option<TcpStream>,
+        inbound: Arc<TcpStream>,
     }
 
     #[derive(Debug)]
@@ -56,12 +45,28 @@ fn main() {
         }
     }
 
+    fn pipe(mut r: Arc<TcpStream>, mut w: Arc<TcpStream>) {
+        let mut r = Arc::get_mut(&mut r).unwrap();
+        let mut w = Arc::get_mut(&mut w).unwrap();
+        let mut buf = vec![0;1024];
+        loop {
+            let size = match r.read(&mut buf) {
+                Ok(size) => size,
+                _ => return,
+            };
+            println!("read {}", size);
+            let wsize = match w.write(&buf[..size]) {
+                Ok(wsize) if wsize == size => wsize,
+                _ => return,
+            };
+            w.flush();
+            println!("write {}", size);
+        }
+    }
+
     impl Session {
         fn new(s: TcpStream) -> Session {
-            Session {
-                inbound: s,
-                outbound: None,
-            }
+            Session { inbound: Arc::new(s) }
         }
 
         fn start(&mut self) {
@@ -73,6 +78,22 @@ fn main() {
                 Some(req) => {
                     println!("read req {:?}", req);
                     let outbound = self.dial(req.addr, req.port);
+                    match outbound {
+                        Ok(outbound) => {
+                            self.write_resp(0, outbound.local_addr().ok());
+                            let outbound = Arc::new(outbound);
+                            let inbound2 = self.inbound.clone();
+                            let outbound2 = outbound.clone();
+                            thread::spawn(move || pipe(inbound2, outbound2));
+                            pipe(outbound, self.inbound.clone())
+                        }
+                        Err(_) => {
+                            let _ = Arc::get_mut(&mut self.inbound)
+                                .unwrap()
+                                .write(&[0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00]);
+                        }
+                    }
                 }
                 None => (),
             }
@@ -82,22 +103,27 @@ fn main() {
             match a {
                 Addr::IPv4(e) => TcpStream::connect(SocketAddr::new(IpAddr::V4(e), p as u16)),
                 Addr::IPv6(e) => TcpStream::connect(SocketAddr::new(IpAddr::V6(e), p as u16)),
-                Addr::Domain(d) => try!(lookup_host(&d)),
+                Addr::Domain(d) => TcpStream::connect(&*format!("{}:{}", d, p)),
+                _ => {
+                    Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused,
+                                            "cannot connect"))
+                }
             }
         }
 
         fn handshake(&mut self) -> bool {
             let mut buf = vec![0;257];
-            match self.inbound.read_exact(&mut buf[..2]) {
+            let inbound = Arc::get_mut(&mut self.inbound).unwrap();
+            match inbound.read_exact(&mut buf[..2]) {
                 Ok(_) => {
                     match buf[0] {
                         5 => {
                             let num = buf[1] as usize;
-                            match self.inbound.read_exact(&mut buf[2..2 + num]) {
+                            match inbound.read_exact(&mut buf[2..2 + num]) {
                                 Ok(_) => {
                                     match buf[2..2 + num].iter().find(|&&x| x == 0) {
                                         Some(_) => {
-                                            match self.inbound.write(&[5, 0]) {
+                                            match inbound.write(&[5, 0]) {
                                                 Ok(_) => true,
                                                 Err(_) => false,
                                             }
@@ -117,7 +143,8 @@ fn main() {
 
         fn read_request(&mut self) -> Option<SocksRequest> {
             let mut buf = vec![0;300];
-            match self.inbound.read(&mut buf[..]) {
+            let inbound = Arc::get_mut(&mut self.inbound).unwrap();
+            match inbound.read(&mut buf[..]) {
                 Ok(n) => {
                     println!("n={}", n);
                     match n {
@@ -133,7 +160,11 @@ fn main() {
                             let (addr, alen) = match buf[3] {
                                 1 => {
                                     match n {
-                                        n if n >= 10 => (Addr::IPv4(to_ipv4(&buf[4..8])), 4),
+                                        n if n >= 10 => {
+                                            let mut p = [0u8; 4];
+                                            p.copy_from_slice(&buf[4..8]);
+                                            (Addr::IPv4(Ipv4Addr::from(p)), 4)
+                                        }
                                         _ => return None,
                                     }
                                 }
@@ -149,7 +180,11 @@ fn main() {
                                         _ => return None,
                                     }
                                 }
-                                4 if n >= 22 => (Addr::IPv6(to_ipv6(&buf[4..20])), 16),
+                                4 if n >= 22 => {
+                                    let mut p = [0u8; 16];
+                                    p.copy_from_slice(&buf[4..20]);
+                                    (Addr::IPv6(Ipv6Addr::from(p)), 16)
+                                }
                                 _ => return None,
                             };
                             req.addr = addr;
@@ -162,6 +197,33 @@ fn main() {
                 }
                 Err(e) => None,
             }
+        }
+
+        fn write_resp(&mut self, code: u8, addr: Option<SocketAddr>) {
+            let mut buf = vec![];
+            buf.push(5);
+            buf.push(code);
+            buf.push(0);
+            let (atype, mut baddr, mut bport) = match addr {
+                Some(SocketAddr::V4(ip)) => {
+                    (1,
+                     Vec::from(&ip.ip().octets()[..]),
+                     vec![(ip.port() >> 8 & 0xff) as u8, (ip.port() & 0xff) as u8])
+                }
+                Some(SocketAddr::V6(ip)) => {
+                    (4,
+                     Vec::from(&ip.ip().octets()[..]),
+                     vec![(ip.port() >> 8 & 0xff) as u8, (ip.port() & 0xff) as u8])
+                }
+                None => (1, vec![0;4], vec![0;2]),
+            };
+            buf.push(atype);
+            buf.append(&mut baddr);
+            buf.append(&mut bport);
+            println!("write resp {:?}", buf);
+            let inbound = Arc::get_mut(&mut self.inbound).unwrap();
+            inbound.write(&buf.as_slice());
+            inbound.flush();
         }
     }
 
